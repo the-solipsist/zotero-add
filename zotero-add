@@ -15,6 +15,7 @@ Run `zotero-add --help` or `zotero-add <command> --help`.
 """
 
 import argparse
+import html
 import json
 import os
 import re
@@ -22,6 +23,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from typing import NoReturn
 
 DEFAULT_TAGS = ["added-by-claude"]
@@ -84,14 +87,16 @@ def find_dups(library, title=None, url=None, doi=None, key=None):
 const lib={lib_js(library)};
 const norm=s=>(s||'').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g,' ').trim();
 const T=norm({J(title or "")}), U=({J(url or "")}).replace(/^https?:\\/\\/(www\\.)?/,'').replace(/\\/$/,''),
-      D=({J(doi or "")}).toLowerCase(), K={J(key or "")};
+      D0={J(doi or "")}, D=({J(doi or "")}).toLowerCase(), K={J(key or "")};
 const hits=new Map();
 async function run(conds){{const s=new Zotero.Search();s.libraryID=lib;s.addCondition('deleted','false');
   for(const c of conds) s.addCondition(...c); for(const id of await s.search()) hits.set(id,1);}}
 if(T){{const words=T.split(' ').filter(w=>w.length>3).sort((a,b)=>b.length-a.length).slice(0,2);
   if(words.length) await run(words.map(w=>['title','contains',w]));}}
 if(U) await run([['url','contains',U]]);
-if(D) await run([['DOI','is',D]]);
+// DOI 'is' is case-sensitive but libraries store mixed case: try every variant
+// (separate searches: conditions within one search are ANDed)
+if(D) for(const v of [D0,D,D0.toUpperCase()]) await run([['DOI','is',v]]);
 if(K) await run([['citationKey','is',K]]);
 const out=[];
 for(const it of await Zotero.Items.getAsync([...hits.keys()])){{
@@ -427,21 +432,447 @@ return JSON.stringify({{storedMissing,linkedMissing,linkedPaths}});"""
     sys.exit(1 if issues else 0)
 
 
+CROSSREF_TYPES = {
+    "journal-article": "journalArticle",
+    "book": "book",
+    "monograph": "book",
+    "edited-book": "book",
+    "reference-book": "book",
+    "chapter": "bookSection",
+    "proceedings-article": "conferencePaper",
+    "report": "report",
+    "standard": "report",
+    "dissertation": "thesis",
+    "dataset": "dataset",
+    "posted-content": "preprint",
+}
+
+
+def clean_text(s):
+    """Unescape entities, strip markup, collapse whitespace."""
+    s = re.sub(r"<[^>]+>", "", html.unescape(s or ""))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def crossref_role(role):
+    return {"author": "author", "editor": "editor", "translator": "translator"}.get(
+        (role or "author").lower(), "contributor"
+    )
+
+
+def norm_title(s):
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower().replace("ß", "ss")).strip()
+
+
+def titles_match(a, b):
+    a, b = norm_title(a), norm_title(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    sh, lo = (a, b) if len(a) < len(b) else (b, a)
+    return len(sh) >= 20 and len(sh) >= 0.7 * len(lo) and sh in lo
+
+
+def pdf_text(path, max_chars=6000):
+    try:
+        from pypdf import PdfReader  # ty: ignore[unresolved-import]
+    except ImportError:
+        die("adopt needs pypdf: pip install pypdf")
+    try:
+        reader = PdfReader(path)
+    except Exception as e:  # noqa: BLE001 -- any corrupt PDF must fail cleanly here
+        die(f"cannot read {path}: {e}")
+    out = []
+    for page in reader.pages[:3]:
+        try:
+            out.append(page.extract_text() or "")
+        except Exception:  # noqa: BLE001,S112 -- a bad page must not kill the scan
+            continue
+        if sum(map(len, out)) >= max_chars:
+            break
+    return "\n".join(out)[:max_chars]
+
+
+def filename_hints(path):
+    """Year + author-ish tokens from Attanger-style filenames. Validation only."""
+    base = os.path.splitext(os.path.basename(path))[0]
+    year = None
+    m = re.search(r"\b((?:19|20)\d{2})\b", base)
+    if m:
+        year = int(m.group(1))
+    head = re.split(r"__| - ", base)[0]
+    tokens = {t for t in re.sub(r"[^a-z]+", " ", head.lower()).split() if len(t) > 2}
+    stop = {"and", "the", "for", "van", "von", "de", "und", "al", "et"}
+    return year, tokens - stop
+
+
+def adopt_arxiv(a, arxiv_id, path):
+    """Create a preprint item from the arXiv API record, then link the file."""
+    import xml.etree.ElementTree as ET
+
+    entry = None
+    for _ in range(3):  # export.arxiv.org often returns empty bodies; retry
+        try:
+            req = urllib.request.Request(
+                f"https://export.arxiv.org/api/query?id_list={arxiv_id}",
+                headers={"User-Agent": "zotero-add/1.0 (personal research tool)"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read().decode("utf-8", "replace")
+            entry = ET.fromstring(raw).find("{http://www.w3.org/2005/Atom}entry")
+        except Exception:  # noqa: BLE001 -- network may fail or return garbled XML
+            entry = None
+        if entry is not None:
+            break
+        time.sleep(5)
+    if entry is None:
+        die(f"arXiv API gave no record for {arxiv_id} after 3 tries")
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    title_el = entry.find("atom:title", ns)
+    title = clean_text("".join(title_el.itertext())) if title_el is not None else ""
+    if not title:
+        die(f"arXiv record for {arxiv_id} has no title")
+    pub_el = entry.find("atom:published", ns)
+    pub = ((pub_el.text or "")[:10]) if pub_el is not None else ""
+    names = [
+        "".join(n.itertext()).strip()
+        for n in entry.findall("atom:author/atom:name", ns)
+    ]
+    creators = []
+    for n in names:
+        parts = n.split()
+        creators.append(
+            {
+                "firstName": " ".join(parts[:-1]),
+                "lastName": parts[-1],
+                "creatorType": "author",
+            }
+            if len(parts) > 1
+            else {"name": n, "creatorType": "author", "fieldMode": 1}
+        )
+    tags = (a.tag or []) + ([] if a.no_default_tags else DEFAULT_TAGS)
+    code = f"""
+const lib={lib_js(a.library)};
+const it=new Zotero.Item('preprint');it.libraryID=lib;
+it.setField('title',{J(title)});it.setField('date',{J(pub)});
+it.setField('url',{J(f"https://arxiv.org/abs/{arxiv_id}")});
+it.setCreators({J(creators)});
+if({J(a.key or "")}) it.setField('citationKey',{J(a.key or "")});
+for(const t of {J(tags)}) it.addTag(t);
+for(const c of {J(a.collection or [])}){{const col=Zotero.Collections.getByLibraryAndKey(lib,c);
+  if(!col) throw new Error('no collection '+c); it.addToCollection(col.id);}}
+await it.saveTx();return it.key;"""
+    key = js(code, 60)
+    if not isinstance(key, str):
+        die("preprint creation did not confirm; check Zotero before retrying")
+    print(f"created {key} (preprint arXiv:{arxiv_id})")
+    time.sleep(3)
+    t = js(
+        f"""const lib={lib_js(a.library)};const it=Zotero.Items.getByLibraryAndKey(lib,{J(key)});
+if(it.getField('title')!=={J(title)}){{it.setField('title',{J(title)});await it.saveTx();return 'fixed';}}
+return 'ok';""",
+        60,
+    )
+    print(f"  title: {t}")
+    link_local_file(a, key, path)
+    return key
+
+
+def link_local_file(a, key, path):
+    """Link (default) or store-copy a local file under a parent item."""
+    if a.stored:
+        link_js = f"const x=await Zotero.Attachments.importFromFile({{file:{J(path)},parentItemID:p.id}});"
+    else:
+        link_js = f"const f=Zotero.File.pathToFile({J(path)});const x=await Zotero.Attachments.linkFromFile({{file:f,parentItemID:p.id}});"
+    code = f"""
+const lib={lib_js(a.library)};const p=Zotero.Items.getByLibraryAndKey(lib,{J(key)});
+{link_js}
+return {{key:x.key,path:x.attachmentPath}};"""
+    out = js(code, 120)
+    if not isinstance(out, dict) or not out.get("key"):
+        die(f"linking failed: {out}")
+    print(f"  linked {out['key']}: {out['path']}")
+
+
+def cmd_adopt(a):
+    path = os.path.abspath(os.path.expanduser(a.file))
+    if not os.path.isfile(path):
+        die(f"no such file: {path}")
+    if not path.lower().endswith(".pdf"):
+        die("adopt currently handles PDFs only")
+    text = pdf_text(path)
+    doi = None
+    m = re.search(r"10\.\d{4,}/[^\s\"'<>]+", text)
+    if m:
+        doi = re.sub(r"[.,;:)\]]+$", "", m.group(0))
+        print(f"  DOI found in PDF: {doi}")
+    arxiv_id = None
+    if not doi:
+        m = re.search(r"arXiv:\s*(\d{4}\.\d{4,5})(v\d+)?", text, re.IGNORECASE)
+        if m:
+            arxiv_id = m.group(1)
+            print(f"  arXiv ID found in PDF: {arxiv_id}")
+    if not doi and not arxiv_id:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        cands = []
+        for ln in lines[:8]:
+            if len(re.sub(r"\s+", "", ln)) >= 20:
+                cands.append(ln)
+                if len(cands) >= 3 or ln.endswith((".", ":", "?")):
+                    break
+        if not cands:
+            die(
+                "could not find a title-like line on page 1; attach manually with `item` + `attach --file`"
+            )
+        tried = []
+        for n in (3, 2, 1):
+            if len(cands) >= n:
+                tried.append(re.sub(r"\s+", " ", " ".join(cands[:n])).strip())
+        year, tokens = filename_hints(path)
+        for cand in tried:
+            print(f"  title candidate: {cand[:90]}")
+            d = api_get(
+                "https://api.openalex.org/works?search="
+                + urllib.parse.quote(cand)
+                + "&per-page=5"
+            )
+            for work in (d or {}).get("results", []):
+                title = work.get("title") or ""
+                if not titles_match(cand, title):
+                    continue
+                if (
+                    year
+                    and work.get("publication_year")
+                    and abs(work["publication_year"] - year) > 1
+                ):
+                    continue
+                surnames = {
+                    norm_title(x["author"]["display_name"]).split()[-1]
+                    for x in work.get("authorships", [])
+                    if x.get("author", {}).get("display_name")
+                }
+                if tokens and surnames and not (tokens & surnames):
+                    continue
+                if not work.get("doi"):
+                    continue
+                doi = re.sub(
+                    r"^https?://(dx\.)?doi\.org/",
+                    "",
+                    work["doi"],
+                    flags=re.IGNORECASE,
+                )
+                print(f"  OpenAlex match: {title[:90]} {doi}")
+                break
+            if doi:
+                break
+        if not doi:
+            print(f"  tried: {[c[:60] for c in tried]}")
+            die(
+                "no confident OpenAlex match; attach manually with `item` + `attach --file`"
+            )
+    if a.dry_run:
+        label = doi if doi else f"arXiv:{arxiv_id}"
+        print(f"  dry-run: would import {label} and link {path}")
+        return
+    if arxiv_id and not doi:
+        key = adopt_arxiv(a, arxiv_id, path)
+        print(json.dumps({"key": key, "arxiv": arxiv_id}))
+        return
+    if not doi:
+        die("no DOI resolved; attach manually with `item` + `attach --file`")
+    r = subprocess.run(
+        [
+            sys.executable,
+            os.path.abspath(__file__),
+            "-L",
+            a.library or "",
+            "import-doi",
+            doi,
+            "--no-pdf",
+        ]
+        + (["--key", a.key] if a.key else [])
+        + (["--force"] if a.force else [])
+        + [c for col in (a.collection or []) for c in ("--collection", col)]
+        + [t for tag in (a.tag or []) for t in ("--tag", tag)]
+        + (["--no-default-tags"] if a.no_default_tags else []),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    if r.returncode != 0:
+        die(f"import-doi failed (exit {r.returncode})")
+    key = None
+    for ln in r.stdout.splitlines()[::-1]:
+        try:
+            key = json.loads(ln).get("key")
+            if key:
+                break
+        except ValueError:
+            continue
+    if not key:
+        die("import-doi gave no item key")
+    link_local_file(a, key, path)
+
+
+def cmd_import_doi(a):
+    doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", a.doi.strip(), flags=re.IGNORECASE)
+    if not a.force:
+        d = find_dups(a.library, None, None, doi, a.key)
+        if d:
+            print("Possible duplicates found; not adding (use --force to add anyway):")
+            for x in d:
+                print(
+                    f"  {x['key']} [{x['citationKey']}] {x['type']} {x['date']} — {x['title']}"
+                )
+            sys.exit(1)
+    work = api_get(f"https://api.crossref.org/works/{doi}")
+    if not work or "message" not in work:
+        die(f"crossref has no record for {doi}")
+    work = work["message"]
+    item_type = CROSSREF_TYPES.get(work.get("type"), "document")
+    title = clean_text((work.get("title") or [""])[0])
+    if not title:
+        die(f"crossref record for {doi} has no title")
+    fields = {"title": title, "DOI": doi}
+    pub = (
+        work.get("published")
+        or work.get("published-print")
+        or work.get("published-online")
+    )
+    parts = (pub.get("date-parts") or [[]])[0] if pub else []
+    if parts:
+        fields["date"] = "-".join(
+            f"{n:02d}" if i else str(n) for i, n in enumerate(parts)
+        )
+    container = (work.get("container-title") or [""])[0]
+    if item_type in ("journalArticle", "conferencePaper", "preprint"):
+        if container:
+            fields[
+                "publicationTitle"
+                if item_type != "conferencePaper"
+                else "proceedingsTitle"
+            ] = container
+    elif item_type == "bookSection" and container:
+        fields["bookTitle"] = container
+    if work.get("volume"):
+        fields["volume"] = work["volume"]
+    if work.get("issue"):
+        fields["issue"] = work["issue"]
+    if work.get("page"):
+        fields["pages"] = work["page"]
+    if work.get("publisher"):
+        fields["publisher" if item_type != "report" else "institution"] = work[
+            "publisher"
+        ]
+    for journal_issn in work.get("ISSN") or []:
+        fields["ISSN"] = journal_issn
+        break
+    for isbn in work.get("ISBN") or []:
+        fields["ISBN"] = isbn
+        break
+    if work.get("abstract"):
+        fields["abstractNote"] = clean_text(work["abstract"])
+    url = ((work.get("resource") or {}).get("primary") or {}).get("URL")
+    if url:
+        fields["url"] = url
+    if (
+        item_type == "conferencePaper"
+        and isinstance(work.get("event"), dict)
+        and work["event"].get("name")
+    ):
+        fields["conferenceName"] = work["event"]["name"]
+    if item_type == "thesis" and work.get("institution"):
+        inst = (
+            work["institution"][0]
+            if isinstance(work["institution"], list)
+            else work["institution"]
+        )
+        fields["university"] = (
+            inst.get("name", inst) if isinstance(inst, dict) else inst
+        )
+    if item_type == "dataset" and work.get("version"):
+        fields["version"] = work["version"]
+    creators = []
+    for role in ("author", "editor", "translator"):
+        for c in work.get(role, None) or []:
+            if c.get("family"):
+                creators.append(
+                    {
+                        "firstName": c.get("given", ""),
+                        "lastName": c["family"],
+                        "creatorType": crossref_role(role),
+                    }
+                )
+            elif c.get("name"):
+                creators.append(
+                    {
+                        "name": c["name"],
+                        "creatorType": crossref_role(role),
+                        "fieldMode": 1,
+                    }
+                )
+    tags = (a.tag or []) + ([] if a.no_default_tags else DEFAULT_TAGS)
+    code = f"""
+const lib={lib_js(a.library)};
+const it=new Zotero.Item({J(item_type)});it.libraryID=lib;
+const skipped=[];
+for(const [k,v]of Object.entries({J(fields)})){{try{{it.setField(k,v);}}catch(e){{skipped.push(k);}}}}
+it.setCreators({J(creators)});
+if({J(a.key or "")}) it.setField('citationKey',{J(a.key or "")});
+for(const t of {J(tags)}) it.addTag(t);
+for(const c of {J(a.collection or [])}){{const col=Zotero.Collections.getByLibraryAndKey(lib,c);
+  if(!col) throw new Error('no collection '+c); it.addToCollection(col.id);}}
+await it.saveTx();return JSON.stringify({{key:it.key,skipped}});"""
+    r = js(code, 60)
+    if not isinstance(r, dict) or "key" not in r:
+        die(
+            "item creation did not confirm; check Zotero before retrying (avoid duplicates)"
+        )
+    key = r["key"]
+    print(f"created {key} ({item_type})" + (f" [{a.key}]" if a.key else ""))
+    if r.get("skipped"):
+        print(f"  fields not valid for {item_type}, skipped: {', '.join(r['skipped'])}")
+    time.sleep(3)  # let the Linter plugin run, then restore the intended title
+    t = js(
+        f"""const lib={lib_js(a.library)};const it=Zotero.Items.getByLibraryAndKey(lib,{J(key)});
+if(it.getField('title')!=={J(title)}){{it.setField('title',{J(title)});await it.saveTx();return 'fixed';}}
+return 'ok';""",
+        60,
+    )
+    print(f"  title: {t}")
+    if not a.no_pdf:
+        sources = [s.strip().lower() for s in a.sources.split(",") if s.strip()]
+        mirrors = [m.strip() for m in a.mirrors.split(",") if m.strip()]
+        fetch_pdf_for(key, a.library, doi, sources, mirrors, a.email, True)
+    print(json.dumps({"key": key, "citationKey": a.key, "doi": doi}))
+
+
 def cmd_fetch_pdf(a):
     """DOI -> PDF cascade: OpenAlex, Unpaywall, arXiv, Sci-Hub mirrors. Attaches first hit."""
     a.sources = [s.strip().lower() for s in a.sources.split(",") if s.strip()]
     a.mirrors = [m.strip() for m in a.mirrors.split(",") if m.strip()]
-    doi = (a.doi or "").strip()
+    if not fetch_pdf_for(
+        a.item, a.library, a.doi, a.sources, a.mirrors, a.email, a.force
+    ):
+        sys.exit(3)
+
+
+def fetch_pdf_for(item_key, library, doi_arg, sources, mirrors, email, force):
+    """Shared fetch-pdf core. Returns attachment key or None (prints progress)."""
+    doi = (doi_arg or "").strip()
     if not doi:
-        code = f"""const lib={lib_js(a.library)};const p=Zotero.Items.getByLibraryAndKey(lib,{J(a.item)});
-if(!p) throw new Error('no item '+{J(a.item)});return p.getField('DOI')||'';"""
+        code = f"""const lib={lib_js(library)};const p=Zotero.Items.getByLibraryAndKey(lib,{J(item_key)});
+if(!p) throw new Error('no item '+{J(item_key)});return p.getField('DOI')||'';"""
         doi = (js(code, 60) or "").strip()
     if not doi:
-        die(f"no DOI given and item {a.item} has none")
+        die(f"no DOI given and item {item_key} has none")
     doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi, flags=re.IGNORECASE)
-    if not a.force:
-        code = f"""const lib={lib_js(a.library)};const p=Zotero.Items.getByLibraryAndKey(lib,{J(a.item)});
-if(!p) throw new Error('no item '+{J(a.item)});
+    if not force:
+        code = f"""const lib={lib_js(library)};const p=Zotero.Items.getByLibraryAndKey(lib,{J(item_key)});
+if(!p) throw new Error('no item '+{J(item_key)});
 for(const id of p.getAttachments()){{const x=Zotero.Items.get(id);
   if(x.attachmentContentType==='application/pdf') return x.key;}} return '';"""
         have = js(code, 60)
@@ -449,25 +880,22 @@ for(const id of p.getAttachments()){{const x=Zotero.Items.get(id);
             print(
                 f"item already has a PDF attachment ({have}); use --force to add another"
             )
-            return
+            return None
     pdf_url, via = None, None
-    if "openalex" in a.sources:
+    if "openalex" in sources:
         pdf_url, via = openalex_pdf(doi)
-    if not pdf_url and "unpaywall" in a.sources:
-        pdf_url, via = unpaywall_pdf(doi, a.email)
-    if (
-        not pdf_url
-        and "arxiv" in a.sources
-        and doi.lower().startswith("10.48550/arxiv.")
-    ):
+    if not pdf_url and "unpaywall" in sources:
+        pdf_url, via = unpaywall_pdf(doi, email)
+    if not pdf_url and "arxiv" in sources and doi.lower().startswith("10.48550/arxiv."):
         pdf_url, via = arxiv_pdf(doi)
-    if not pdf_url and "scihub" in a.sources:
-        pdf_url, via = scihub_pdf(doi, a.mirrors)
+    if not pdf_url and "scihub" in sources:
+        pdf_url, via = scihub_pdf(doi, mirrors)
     if not pdf_url:
-        die(f"no PDF found for {doi} (tried: {','.join(a.sources)})")
+        print(f"no PDF found for {doi} (tried: {','.join(sources)})")
+        return None
     print(f"  found via {via}: {pdf_url[:100]}")
     code = f"""
-const lib={lib_js(a.library)};const p=Zotero.Items.getByLibraryAndKey(lib,{J(a.item)});
+const lib={lib_js(library)};const p=Zotero.Items.getByLibraryAndKey(lib,{J(item_key)});
 const x=await Zotero.Attachments.importFromURL({{libraryID:lib,url:{J(pdf_url)},
   parentItemID:p.id,contentType:'application/pdf',title:p.getField('title')}});
 return {{key:x.key,exists:await x.fileExists(),path:x.getFilePath()}};"""
@@ -475,19 +903,19 @@ return {{key:x.key,exists:await x.fileExists(),path:x.getFilePath()}};"""
     if not isinstance(r, dict) or not r.get("exists"):
         die(f"downloaded but file missing: {r}")
     print(f"  attached {r['key']}: {r['path']}")
+    return r["key"]
 
 
 def api_get(url, timeout=30):
+    """GET JSON over HTTPS with the stdlib only (no curl dependency)."""
     try:
-        p = subprocess.run(
-            ["curl", "-s", "-m", str(timeout), url],
-            capture_output=True,
-            text=True,
-            timeout=timeout + 10,
-            check=False,
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "zotero-add/1.0 (personal research tool)"}
         )
-        return json.loads(p.stdout) if p.stdout.strip() else None
-    except (ValueError, subprocess.SubprocessError):
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode("utf-8", "replace")
+        return json.loads(body) if body.strip() else None
+    except (ValueError, OSError):
         return None
 
 
@@ -634,6 +1062,36 @@ def main():
     p.set_defaults(fn=cmd_item)
 
     p = sub.add_parser(
+        "import-doi",
+        help="create an item from Crossref metadata by DOI (dup-checked), then fetch its PDF",
+    )
+    p.add_argument("doi", help="DOI, with or without https://doi.org/ prefix")
+    p.add_argument("--key", help="citation key to pin (Zotero 7 citationKey field)")
+    p.add_argument("--collection", action="append", metavar="COLLKEY")
+    p.add_argument("--tag", action="append")
+    p.add_argument(
+        "--no-default-tags", action="store_true", help=f"don't add {DEFAULT_TAGS}"
+    )
+    p.add_argument("--no-pdf", action="store_true", help="skip the fetch-pdf cascade")
+    p.add_argument(
+        "--sources",
+        default="openalex,unpaywall,arxiv,scihub",
+        help="fetch-pdf sources, comma-separated in order",
+    )
+    p.add_argument(
+        "--mirrors",
+        default="https://sci-hub.in/,https://sci-hub.ee/",
+        help="Sci-Hub mirrors, comma-separated",
+    )
+    p.add_argument(
+        "--email",
+        default=os.environ.get("UNPAYWALL_EMAIL", ""),
+        help="contact email for Unpaywall (or set $UNPAYWALL_EMAIL)",
+    )
+    p.add_argument("--force", action="store_true", help="skip the duplicate check")
+    p.set_defaults(fn=cmd_import_doi)
+
+    p = sub.add_parser(
         "attach", help="add a file and/or snapshot to an existing item, then verify"
     )
     p.add_argument("item", help="Zotero item key (8 chars)")
@@ -641,6 +1099,30 @@ def main():
     p.add_argument("--snapshot", action="store_true")
     p.add_argument("--url", help="snapshot this URL instead of the item's URL")
     p.set_defaults(fn=cmd_attach)
+
+    p = sub.add_parser(
+        "adopt",
+        help="create a parent item for an orphan PDF (DOI/title lookup) and link it",
+    )
+    p.add_argument("file", help="local PDF file to adopt")
+    p.add_argument("--key", help="citation key to pin on the created item")
+    p.add_argument("--collection", action="append", metavar="COLLKEY")
+    p.add_argument("--tag", action="append")
+    p.add_argument(
+        "--no-default-tags", action="store_true", help=f"don't add {DEFAULT_TAGS}"
+    )
+    p.add_argument(
+        "--stored",
+        action="store_true",
+        help="copy the file into Zotero storage instead of linking in place",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report the match without creating or linking anything",
+    )
+    p.add_argument("--force", action="store_true", help="skip the duplicate check")
+    p.set_defaults(fn=cmd_adopt)
 
     p = sub.add_parser("dups", help="look for existing records (exit 1 if any)")
     p.add_argument("--title")
@@ -683,8 +1165,7 @@ def main():
     p.add_argument(
         "--email",
         default=os.environ.get("UNPAYWALL_EMAIL", ""),
-        help="contact email for Unpaywall (or set $UNPAYWALL_EMAIL); "
-        "without one, the Unpaywall source is skipped",
+        help="contact email for Unpaywall (or set $UNPAYWALL_EMAIL)",
     )
     p.add_argument(
         "--force", action="store_true", help="attach even if the item already has a PDF"

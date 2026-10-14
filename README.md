@@ -12,7 +12,8 @@ files, bridge timeouts that still complete).
 
 ## Requires
 
-- Python 3 (stdlib only — no dependencies)
+- Python 3 (stdlib only, except `pypdf` for the `adopt` command:
+  `pip install pypdf`)
 - [`zotero-cli`](https://github.com/PiaoyangGuohai1/cli-anything-zotero)
   (`uv tool install cli-anything-zotero`) and a **running Zotero** with its
   JS Bridge plugin
@@ -34,6 +35,14 @@ zotero-add item report --title "Data Governance Framework: India" \
   --key prakashIndia2024 --person "Prakash, Pranesh" --date 2024-12 \
   --field institution=LIRNEasia --collection DEADB33F --tag otr2026 \
   --file report.pdf
+
+# 2b. Or create from a DOI via Crossref metadata (editors split out,
+# entities unescaped, key pinned), then fetch its PDF automatically.
+zotero-add import-doi 10.1017/S0035869X00130837 --key burrowProtoIndoaryans1973
+
+# 2c. Or adopt an orphan PDF: finds its DOI/arXiv ID (else strict
+# title match), creates the parent item, and links the file in place.
+zotero-add adopt ~/papers/mystery-paper.pdf
 
 # 3. Fetch a missing PDF by DOI (OpenAlex → Unpaywall → arXiv → Sci-Hub)
 zotero-add fetch-pdf ITEMKEY
