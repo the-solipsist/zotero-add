@@ -48,7 +48,13 @@ zotero-add adopt ~/papers/mystery-paper.pdf
 zotero-add fetch-pdf ITEMKEY
 UNPAYWALL_EMAIL=you@example.org zotero-add fetch-pdf ITEMKEY --force
 
-# 4. Inspect / repair
+# 4. Fill missing metadata (DOI, abstract, language, date) via OpenAlex / Crossref
+# Strict matching (title + year ±1 + author surname overlap); dry-run diff by default
+zotero-add fill-metadata ITEMKEY
+zotero-add fill-metadata ITEMKEY --apply
+zotero-add fill-metadata --collection COLLKEY --apply
+
+# 5. Inspect / repair
 zotero-add check ITEMKEY   # attachments + whether their files exist
 zotero-add audit           # whole library: missing files + disk orphans (exit 1 if issues)
 zotero-add repair --since 2026-10-01   # put back files a mover plugin displaced

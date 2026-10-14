@@ -981,6 +981,416 @@ return JSON.stringify({{url:null}});"""
     return None, None
 
 
+# ---------------------------------------------------------------- fill-metadata
+def reconstruct_openalex_abstract(inv):
+    """Reconstruct plain-text abstract from OpenAlex inverted index."""
+    if not inv or not isinstance(inv, dict):
+        return ""
+    words = sorted([(pos, w) for w, poses in inv.items() for pos in poses])
+    return clean_text(" ".join(w for _, w in words))
+
+
+def get_creator_surnames(creators):
+    surnames = set()
+    for c in creators or []:
+        last = c.get("lastName") or c.get("name") or ""
+        tokens = norm_title(last).split()
+        if tokens:
+            surnames.add(tokens[-1])
+    return surnames
+
+
+def get_openalex_surnames(authorships):
+    surnames = set()
+    for a in authorships or []:
+        disp = a.get("author", {}).get("display_name") or ""
+        tokens = norm_title(disp).split()
+        if tokens:
+            surnames.add(tokens[-1])
+    return surnames
+
+
+def get_crossref_surnames(authors):
+    surnames = set()
+    for a in authors or []:
+        last = a.get("family") or a.get("name") or ""
+        tokens = norm_title(last).split()
+        if tokens:
+            surnames.add(tokens[-1])
+    return surnames
+
+
+def extract_year(date_val):
+    if not date_val:
+        return None
+    if isinstance(date_val, int):
+        return date_val
+    m = re.search(r"\b((?:19|20)\d{2})\b", str(date_val))
+    return int(m.group(1)) if m else None
+
+
+def match_candidate(
+    item_title, item_year, item_surnames, cand_title, cand_year, cand_surnames
+):
+    """Adopt-grade strict matching: title containment both ways, year +-1, surname overlap."""
+    if not titles_match(item_title, cand_title):
+        return False
+    if (
+        item_year is not None
+        and cand_year is not None
+        and abs(item_year - cand_year) > 1
+    ):
+        return False
+    return not (item_surnames and cand_surnames and not (item_surnames & cand_surnames))
+
+
+def search_openalex_metadata(title, item_year, item_surnames):
+    cand_url = f"https://api.openalex.org/works?search={urllib.parse.quote(clean_text(title))}&per-page=5"
+    data = api_get(cand_url)
+    for work in (data or {}).get("results", []):
+        cand_title = work.get("title") or ""
+        cand_year = extract_year(
+            work.get("publication_year") or work.get("publication_date")
+        )
+        cand_surnames = get_openalex_surnames(work.get("authorships", []))
+        if match_candidate(
+            title, item_year, item_surnames, cand_title, cand_year, cand_surnames
+        ):
+            return work
+    return None
+
+
+def search_crossref_metadata(title, item_year, item_surnames):
+    cand_url = f"https://api.crossref.org/works?query.title={urllib.parse.quote(clean_text(title))}&rows=5"
+    data = api_get(cand_url)
+    for work in (data or {}).get("message", {}).get("items", []):
+        cand_titles = work.get("title") or []
+        cand_title = cand_titles[0] if cand_titles else ""
+        pub = (
+            work.get("published")
+            or work.get("published-print")
+            or work.get("published-online")
+        )
+        parts = (pub.get("date-parts") or [[]])[0] if pub else []
+        cand_year = parts[0] if parts else None
+        cand_surnames = get_crossref_surnames(work.get("author", []))
+        if match_candidate(
+            title, item_year, item_surnames, cand_title, cand_year, cand_surnames
+        ):
+            return work
+    return None
+
+
+def resolve_metadata_for_item(item):
+    """Find matching metadata via OpenAlex and Crossref. Returns candidate fields dict or None."""
+    item_doi = (item.get("DOI") or "").strip()
+    if item_doi:
+        item_doi = re.sub(
+            r"^https?://(dx\.)?doi\.org/", "", item_doi, flags=re.IGNORECASE
+        )
+    item_title = item.get("title") or ""
+    item_year = extract_year(item.get("date"))
+    item_surnames = get_creator_surnames(item.get("creators", []))
+
+    doi = item_doi
+    openalex_work = None
+    crossref_work = None
+
+    if doi:
+        openalex_work = api_get(f"https://api.openalex.org/works/https://doi.org/{doi}")
+        crossref_data = api_get(f"https://api.crossref.org/works/{doi}")
+        crossref_work = (
+            crossref_data.get("message") if isinstance(crossref_data, dict) else None
+        )
+        cand_title = ""
+        if crossref_work:
+            cand_titles = crossref_work.get("title") or []
+            cand_title = cand_titles[0] if cand_titles else ""
+        elif openalex_work:
+            cand_title = openalex_work.get("title") or ""
+        if cand_title and item_title and not titles_match(item_title, cand_title):
+            return None
+    else:
+        # Check url and extra for embedded DOIs (e.g. from publisher URL or archive note)
+        for src in (item.get("url") or "", item.get("extra") or ""):
+            m = re.search(r"10\.\d{4,}/[^\s\"'<>?#]+", src)
+            if m:
+                cand_doi = re.sub(r"[.,;:)\]]+$", "", m.group(0))
+                crossref_data = api_get(f"https://api.crossref.org/works/{cand_doi}")
+                if isinstance(crossref_data, dict) and "message" in crossref_data:
+                    msg = crossref_data["message"]
+                    cand_titles = msg.get("title") or []
+                    cand_title = cand_titles[0] if cand_titles else ""
+                    if not item_title or titles_match(item_title, cand_title):
+                        doi = cand_doi
+                        crossref_work = msg
+                        openalex_work = api_get(
+                            f"https://api.openalex.org/works/https://doi.org/{doi}"
+                        )
+                        break
+
+        if not doi and item_title:
+            openalex_work = search_openalex_metadata(
+                item_title, item_year, item_surnames
+            )
+            if openalex_work and openalex_work.get("doi"):
+                doi = re.sub(
+                    r"^https?://(dx\.)?doi\.org/",
+                    "",
+                    openalex_work["doi"],
+                    flags=re.IGNORECASE,
+                )
+                crossref_data = api_get(f"https://api.crossref.org/works/{doi}")
+                crossref_work = (
+                    crossref_data.get("message")
+                    if isinstance(crossref_data, dict)
+                    else None
+                )
+            elif not openalex_work:
+                crossref_work = search_crossref_metadata(
+                    item_title, item_year, item_surnames
+                )
+                if crossref_work and crossref_work.get("DOI"):
+                    doi = crossref_work["DOI"]
+                    openalex_work = api_get(
+                        f"https://api.openalex.org/works/https://doi.org/{doi}"
+                    )
+
+    if not openalex_work and not crossref_work:
+        return None
+
+    cand = {}
+    if doi:
+        cand["DOI"] = doi
+
+    abstract = ""
+    if crossref_work and crossref_work.get("abstract"):
+        abstract = clean_text(crossref_work["abstract"])
+    if not abstract and openalex_work:
+        abstract = reconstruct_openalex_abstract(
+            openalex_work.get("abstract_inverted_index")
+        )
+    if abstract:
+        cand["abstractNote"] = abstract
+
+    lang = ""
+    if openalex_work and openalex_work.get("language"):
+        lang = openalex_work["language"]
+    elif crossref_work and crossref_work.get("language"):
+        lang = crossref_work["language"]
+    if lang:
+        cand["language"] = lang
+
+    cand_date = ""
+    if crossref_work:
+        pub = (
+            crossref_work.get("published")
+            or crossref_work.get("published-print")
+            or crossref_work.get("published-online")
+        )
+        parts = (pub.get("date-parts") or [[]])[0] if pub else []
+        if parts:
+            cand_date = "-".join(
+                f"{n:02d}" if i else str(n) for i, n in enumerate(parts)
+            )
+    if not cand_date and openalex_work:
+        cand_date = (
+            openalex_work.get("publication_date")
+            or (
+                str(openalex_work.get("publication_year"))
+                if openalex_work.get("publication_year")
+                else ""
+            )
+            or ""
+        )
+    if cand_date:
+        cand["date"] = cand_date
+
+    return cand
+
+
+def apply_metadata_updates(library, key, updates):
+    code = f"""
+const lib={lib_js(library)};
+const it=Zotero.Items.getByLibraryAndKey(lib,{J(key)});
+if(!it) throw new Error('no item '+{J(key)});
+const origTitle=it.getField('title');
+const skipped=[];
+for(const [k,v] of Object.entries({J(updates)})){{
+  try {{
+    it.setField(k,v);
+  }} catch(e) {{
+    skipped.push(k);
+  }}
+}}
+await it.saveTx();
+if(it.getField('title')!==origTitle){{
+  it.setField('title',origTitle);
+  await it.saveTx();
+}}
+return JSON.stringify({{key:it.key,skipped}});"""
+    r = js(code, 60)
+    if isinstance(r, dict) and "_timeout" in r:
+        die(f"bridge timed out applying updates to {key}")
+    if not isinstance(r, dict) or "key" not in r:
+        die(f"failed to update {key}: {r}")
+    if r.get("skipped"):
+        print(f"  fields skipped (not valid for item type): {', '.join(r['skipped'])}")
+    return r
+
+
+def cmd_fill_metadata(a):
+    if not a.items and not a.collection and not a.since and not a.all:
+        die("specify item key(s) or filter with --collection, --since, or --all")
+
+    field_map = {
+        "doi": "DOI",
+        "abstract": "abstractNote",
+        "language": "language",
+        "date": "date",
+    }
+    requested_fields = []
+    for f in [x.strip().lower() for x in a.fields.split(",") if x.strip()]:
+        if f not in field_map:
+            die(
+                f"unknown field '{f}' in --fields (allowed: doi, abstract, language, date)"
+            )
+        requested_fields.append(field_map[f])
+
+    code = f"""
+const lib={lib_js(a.library)};
+const keys={J([k.strip().upper() for k in (a.items or []) if k.strip()])};
+const collKey={J(a.collection or "")};
+const since={J(a.since or "")};
+const items=[];
+if(keys.length>0){{
+  for(const k of keys){{
+    const it=Zotero.Items.getByLibraryAndKey(lib,k);
+    if(it && it.isRegularItem()) items.push(it);
+  }}
+}} else {{
+  const s=new Zotero.Search();
+  s.libraryID=lib;
+  s.addCondition('deleted','false');
+  if(collKey){{
+    const col=Zotero.Collections.getByLibraryAndKey(lib,collKey);
+    if(!col) throw new Error('no collection '+collKey);
+    s.addCondition('collectionID','is',col.id);
+  }}
+  if(since){{
+    s.addCondition('dateAdded','isAfter',since);
+  }}
+  for(const it of await Zotero.Items.getAsync(await s.search())){{
+    if(it.isRegularItem()) items.push(it);
+  }}
+}}
+const out=[];
+for(const it of items){{
+  const getF=f=>{{
+    try {{
+      if(Zotero.ItemFields.isValidForType(Zotero.ItemFields.getID(f),it.itemTypeID)){{
+        return it.getField(f)||'';
+      }}
+    }}catch(e){{}}
+    return null;
+  }};
+  out.push({{
+    key: it.key,
+    type: it.itemType,
+    title: it.getField('title')||'',
+    citationKey: getF('citationKey')||'',
+    DOI: getF('DOI'),
+    abstractNote: getF('abstractNote'),
+    language: getF('language'),
+    date: getF('date'),
+    url: it.getField('url')||'',
+    extra: it.getField('extra')||'',
+    creators: it.getCreators()
+  }});
+}}
+return JSON.stringify(out);"""
+    items = js(code, 120)
+    if isinstance(items, dict) and "_timeout" in items:
+        die(
+            "bridge timed out querying items; narrow the search with --collection or --since"
+        )
+    if not isinstance(items, list):
+        die(f"unexpected bridge response: {str(items)[:200]}")
+
+    if not items:
+        print("no matching regular items found")
+        return
+
+    req_keys = [k.strip().upper() for k in (a.items or []) if k.strip()]
+    if req_keys:
+        found_keys = {it["key"] for it in items}
+        for k in req_keys:
+            if k not in found_keys:
+                print(f"item {k} not found (or not a regular item)")
+
+    processed = 0
+    updated = 0
+    up_to_date = 0
+    no_match = 0
+
+    for it in items:
+        processed += 1
+        key = it["key"]
+        cite_key = it["citationKey"] or "-"
+        itype = it["type"]
+        title = it["title"] or "(no title)"
+        date = it["date"] or "-"
+
+        blank_fields = [f for f in requested_fields if it.get(f) == ""]
+
+        if not blank_fields:
+            up_to_date += 1
+            if len(items) <= 5:
+                print(
+                    f"{key} [{cite_key}] {itype} ({date}) — {title[:70]}\n  (all requested fields present)"
+                )
+            continue
+
+        cand = resolve_metadata_for_item(it)
+        if not cand:
+            no_match += 1
+            print(
+                f"{key} [{cite_key}] {itype} ({date}) — {title[:70]}\n  (no confident match found)"
+            )
+            continue
+
+        updates = {k: v for k, v in cand.items() if k in blank_fields and v}
+        if not updates:
+            no_match += 1
+            print(
+                f"{key} [{cite_key}] {itype} ({date}) — {title[:70]}\n  (match found but no new fields to fill)"
+            )
+            continue
+
+        updated += 1
+        print(f"{key} [{cite_key}] {itype} ({date}) — {title[:70]}")
+        for k in sorted(updates.keys()):
+            v = updates[k]
+            if k == "abstractNote":
+                preview = v[:100] + ("..." if len(v) > 100 else "")
+                print(f"  {k:<12}: + {preview!r} ({len(v)} chars)")
+            else:
+                print(f"  {k:<12}: + {v}")
+
+        if a.apply:
+            apply_metadata_updates(a.library, key, updates)
+            print(f"  applied updates to {key}")
+
+        time.sleep(0.2)
+
+    action_label = "updated" if a.apply else "would be updated"
+    print(
+        f"\nProcessed {processed} items: {updated} {action_label}, {up_to_date} up-to-date, {no_match} no match/new fields"
+    )
+    if not a.apply and updated > 0:
+        print("dry-run: run with --apply to write changes")
+
+
 def cmd_repair(a):
     code = f"""
 const lib={lib_js(a.library)};
@@ -1171,6 +1581,32 @@ def main():
         "--force", action="store_true", help="attach even if the item already has a PDF"
     )
     p.set_defaults(fn=cmd_fetch_pdf)
+
+    p = sub.add_parser(
+        "fill-metadata",
+        help="backfill blank DOI/abstract/language/date via OpenAlex/Crossref with strict matching",
+    )
+    p.add_argument("items", nargs="*", help="Zotero item key(s) (8 chars)")
+    p.add_argument(
+        "--collection", metavar="COLLKEY", help="process items in this collection"
+    )
+    p.add_argument(
+        "--since", metavar="YYYY-MM-DD", help="only items added after this date"
+    )
+    p.add_argument(
+        "--all", action="store_true", help="scan all regular items in the library"
+    )
+    p.add_argument(
+        "--apply",
+        action="store_true",
+        help="write changes to Zotero (default: dry-run diff only)",
+    )
+    p.add_argument(
+        "--fields",
+        default="doi,abstract,language,date",
+        help="comma-separated fields to backfill (default: doi,abstract,language,date)",
+    )
+    p.set_defaults(fn=cmd_fill_metadata)
 
     p = sub.add_parser(
         "repair", help="move files Attanger displaced back into group storage"
