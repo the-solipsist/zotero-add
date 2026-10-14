@@ -13,6 +13,7 @@ Guards against the failure modes seen in practice:
 
 Run `zotero-add --help` or `zotero-add <command> --help`.
 """
+
 import argparse
 import json
 import os
@@ -21,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+from typing import NoReturn
 
 DEFAULT_TAGS = ["added-by-claude"]
 
@@ -29,8 +31,13 @@ DEFAULT_TAGS = ["added-by-claude"]
 def js(code, wait=60):
     """Run JS in Zotero; return the value the code returns (JSON-decoded if possible)."""
     try:
-        p = subprocess.run(["zotero-cli", "--json", "js", "--wait", str(wait), code],
-                           capture_output=True, text=True, timeout=wait + 30)
+        p = subprocess.run(
+            ["zotero-cli", "--json", "js", "--wait", str(wait), code],
+            capture_output=True,
+            text=True,
+            timeout=wait + 30,
+            check=False,
+        )
     except subprocess.TimeoutExpired:
         return {"_timeout": True}
     out = p.stdout.strip()
@@ -50,7 +57,7 @@ def js(code, wait=60):
     return val
 
 
-def die(msg, code=2):
+def die(msg, code=2) -> NoReturn:
     print(f"zotero-add: {msg}", file=sys.stderr)
     sys.exit(code)
 
@@ -76,8 +83,8 @@ def find_dups(library, title=None, url=None, doi=None, key=None):
     code = f"""
 const lib={lib_js(library)};
 const norm=s=>(s||'').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g,' ').trim();
-const T=norm({J(title or '')}), U=({J(url or '')}).replace(/^https?:\\/\\/(www\\.)?/,'').replace(/\\/$/,''),
-      D=({J(doi or '')}).toLowerCase(), K={J(key or '')};
+const T=norm({J(title or "")}), U=({J(url or "")}).replace(/^https?:\\/\\/(www\\.)?/,'').replace(/\\/$/,''),
+      D=({J(doi or "")}).toLowerCase(), K={J(key or "")};
 const hits=new Map();
 async function run(conds){{const s=new Zotero.Search();s.libraryID=lib;s.addCondition('deleted','false');
   for(const c of conds) s.addCondition(...c); for(const id of await s.search()) hits.set(id,1);}}
@@ -118,7 +125,10 @@ return JSON.stringify(out);"""
 
 
 def attanger_dest():
-    d = js("return Zotero.Prefs.get('extensions.zotero.zoteroattanger.destDir',true)||''", 30)
+    d = js(
+        "return Zotero.Prefs.get('extensions.zotero.zoteroattanger.destDir',true)||''",
+        30,
+    )
     return d if isinstance(d, str) else ""
 
 
@@ -166,8 +176,10 @@ def verify_and_repair(item_key, library, settle=8):
     for a in attachments(item_key, library):
         if a["linkMode"] in (0, 1) and not a["exists"]:
             got = restore_file(a["expected"])
-            print(f"  attachment {a['key']}: file missing; "
-                  + (f"restored to {got}" if got else "COULD NOT FIND moved file"))
+            print(
+                f"  attachment {a['key']}: file missing; "
+                + (f"restored to {got}" if got else "COULD NOT FIND moved file")
+            )
             if not got:
                 bad.append(a["key"])
         else:
@@ -184,14 +196,16 @@ const lib={lib_js(library)};const p=Zotero.Items.getByLibraryAndKey(lib,{J(item_
 const a=await Zotero.Attachments.importFromFile({{file:{J(path)},parentItemID:p.id}});
 return a.key;"""
     r = js(code, wait)
-    print(f"  attached file {os.path.basename(path)}"
-          + (" (bridge timed out; will verify)" if isinstance(r, dict) else f" as {r}"))
+    print(
+        f"  attached file {os.path.basename(path)}"
+        + (" (bridge timed out; will verify)" if isinstance(r, dict) else f" as {r}")
+    )
 
 
 def attach_snapshot(item_key, library, url=None, wait=240):
     code = f"""
 const lib={lib_js(library)};const p=Zotero.Items.getByLibraryAndKey(lib,{J(item_key)});
-const url={J(url or '')}||p.getField('url'); if(!url) throw new Error('item has no URL');
+const url={J(url or "")}||p.getField('url'); if(!url) throw new Error('item has no URL');
 for(const id of p.getAttachments()) if(Zotero.Items.get(id).attachmentContentType==='text/html') return 'exists';
 const a=await Zotero.Attachments.importFromURL({{libraryID:lib,url,parentItemID:p.id,contentType:'text/html',title:'Snapshot'}});
 return a.key;"""
@@ -202,19 +216,34 @@ return a.key;"""
     if isinstance(r, dict):  # timed out on the bridge; Zotero may still finish
         for _ in range(24):
             time.sleep(5)
-            if any(a["contentType"] == "text/html" and a["exists"] for a in attachments(item_key, library)):
+            if any(
+                a["contentType"] == "text/html" and a["exists"]
+                for a in attachments(item_key, library)
+            ):
                 break
-    html = [a for a in attachments(item_key, library) if a["contentType"] == "text/html" and a["exists"]]
+    html = [
+        a
+        for a in attachments(item_key, library)
+        if a["contentType"] == "text/html" and a["exists"]
+    ]
     if not html:
-        print("  snapshot: FAILED (site may block Zotero; fetch it yourself and use `attach --file x.html`)")
+        print(
+            "  snapshot: FAILED (site may block Zotero; fetch it yourself and use `attach --file x.html`)"
+        )
         return
     f = html[0]["expected"]
     with open(f, errors="ignore") as fh:
         head = fh.read(200000)
-    title = re.findall(r"<title>(.*?)</title>", head, re.S)
-    blocked = re.search(r"Just a moment|Access denied|403 Forbidden|captcha|Web Page Blocked", head, re.I)
-    print(f"  snapshot {html[0]['key']}: {os.path.getsize(f)} bytes, title={title[0].strip()[:70] if title else '?'!r}"
-          + ("  WARNING: looks like a block page" if blocked else ""))
+    title = re.findall(r"<title>(.*?)</title>", head, re.DOTALL)
+    blocked = re.search(
+        r"Just a moment|Access denied|403 Forbidden|captcha|Web Page Blocked",
+        head,
+        re.IGNORECASE,
+    )
+    print(
+        f"  snapshot {html[0]['key']}: {os.path.getsize(f)} bytes, title={title[0].strip()[:70] if title else '?'!r}"
+        + ("  WARNING: looks like a block page" if blocked else "")
+    )
 
 
 # ---------------------------------------------------------------- commands
@@ -237,10 +266,10 @@ def parse_creators(persons, orgs, order):
 
 
 class Ordered(argparse.Action):
-    def __call__(self, parser, ns, values, option_string=None):
-        lst = getattr(ns, "creator_order", None) or []
+    def __call__(self, parser, namespace, values, option_string=None):
+        lst = getattr(namespace, "creator_order", None) or []
         lst.append((self.dest, values))
-        ns.creator_order = lst
+        namespace.creator_order = lst
 
 
 def cmd_item(a):
@@ -249,12 +278,16 @@ def cmd_item(a):
         if d:
             print("Possible duplicates found; not adding (use --force to add anyway):")
             for x in d:
-                print(f"  {x['key']} [{x['citationKey']}] {x['type']} {x['date']} — {x['title']}  (match: {','.join(x['match'])})")
+                print(
+                    f"  {x['key']} [{x['citationKey']}] {x['type']} {x['date']} — {x['title']}  (match: {','.join(x['match'])})"
+                )
             sys.exit(1)
     fields = dict(a.field_dict)
     fields["title"] = a.title
-    if a.date: fields["date"] = a.date
-    if a.url: fields["url"] = a.url
+    if a.date:
+        fields["date"] = a.date
+    if a.url:
+        fields["url"] = a.url
     creators = parse_creators(None, None, getattr(a, "creator_order", None) or [])
     tags = (a.tag or []) + ([] if a.no_default_tags else DEFAULT_TAGS)
     code = f"""
@@ -262,27 +295,31 @@ const lib={lib_js(a.library)};
 const it=new Zotero.Item({J(a.type)});it.libraryID=lib;
 for(const [k,v] of Object.entries({J(fields)})) it.setField(k,v);
 it.setCreators({J(creators)});
-if({J(a.key or '')}) it.setField('citationKey',{J(a.key or '')});
+if({J(a.key or "")}) it.setField('citationKey',{J(a.key or "")});
 for(const t of {J(tags)}) it.addTag(t);
 for(const c of {J(a.collection or [])}){{const col=Zotero.Collections.getByLibraryAndKey(lib,c);
   if(!col) throw new Error('no collection '+c); it.addToCollection(col.id);}}
 await it.saveTx();return it.key;"""
     key = js(code, 60)
     if not isinstance(key, str):
-        die("item creation did not confirm; check Zotero before retrying (avoid duplicates)")
+        die(
+            "item creation did not confirm; check Zotero before retrying (avoid duplicates)"
+        )
     print(f"created {key}" + (f" [{a.key}]" if a.key else ""))
     time.sleep(3)  # let the Linter plugin run, then restore the intended title
-    t = js(f"""const lib={lib_js(a.library)};const it=Zotero.Items.getByLibraryAndKey(lib,{J(key)});
+    t = js(
+        f"""const lib={lib_js(a.library)};const it=Zotero.Items.getByLibraryAndKey(lib,{J(key)});
 if(it.getField('title')!=={J(a.title)}){{it.setField('title',{J(a.title)});await it.saveTx();return 'fixed';}}
-return 'ok';""", 60)
+return 'ok';""",
+        60,
+    )
     print(f"  title: {t}")
     for f in a.file or []:
         attach_file(key, a.library, f)
     if a.snapshot:
         attach_snapshot(key, a.library)
-    if a.file or a.snapshot:
-        if verify_and_repair(key, a.library):
-            sys.exit(3)
+    if (a.file or a.snapshot) and verify_and_repair(key, a.library):
+        sys.exit(3)
     print(json.dumps({"key": key, "citationKey": a.key}))
 
 
@@ -300,13 +337,17 @@ def cmd_attach(a):
 def cmd_dups(a):
     d = find_dups(a.library, a.title, a.url, a.doi, a.key)
     for x in d:
-        print(f"{x['key']} [{x['citationKey']}] {x['type']} {x['date']} — {x['title']}  (match: {','.join(x['match'])})")
+        print(
+            f"{x['key']} [{x['citationKey']}] {x['type']} {x['date']} — {x['title']}  (match: {','.join(x['match'])})"
+        )
     sys.exit(1 if d else 0)
 
 
 def cmd_check(a):
     for x in attachments(a.item, a.library):
-        print(f"{x['key']} linkMode={x['linkMode']} {x['contentType']} exists={x['exists']}  {x['expected']}")
+        print(
+            f"{x['key']} linkMode={x['linkMode']} {x['contentType']} exists={x['exists']}  {x['expected']}"
+        )
 
 
 def cmd_audit(a):
@@ -348,16 +389,23 @@ return JSON.stringify({{storedMissing,linkedMissing,linkedPaths}});"""
         die(f"unexpected audit result: {str(r)[:200]}")
     issues = 0
     for m in r["storedMissing"]:
-        print(f"stored-missing {m['key']} [{m['parent']}] {m['title']}  expected: {m['expected']}")
+        print(
+            f"stored-missing {m['key']} [{m['parent']}] {m['title']}  expected: {m['expected']}"
+        )
         issues += 1
     for m in r["linkedMissing"]:
-        print(f"linked-missing {m['key']} [{m['parent']}] {m['title']}  path: {m['path']}")
+        print(
+            f"linked-missing {m['key']} [{m['parent']}] {m['title']}  path: {m['path']}"
+        )
         issues += 1
     # disk orphans: pdf/epub under the Attanger destDir (outside storage/) with no linked record
     dest = attanger_dest()
     if dest and os.path.isdir(dest):
-        known = {os.path.normpath(p[len("attachments:"):] if p.startswith("attachments:") else p)
-                 for p in r["linkedPaths"] if p}
+        known = {
+            os.path.normpath(p.removeprefix("attachments:"))
+            for p in r["linkedPaths"]
+            if p
+        }
         storage = os.path.join(dest, "storage")
         n = 0
         for root, dirs, files in os.walk(dest):
@@ -390,7 +438,7 @@ if(!p) throw new Error('no item '+{J(a.item)});return p.getField('DOI')||'';"""
         doi = (js(code, 60) or "").strip()
     if not doi:
         die(f"no DOI given and item {a.item} has none")
-    doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi, flags=re.I)
+    doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi, flags=re.IGNORECASE)
     if not a.force:
         code = f"""const lib={lib_js(a.library)};const p=Zotero.Items.getByLibraryAndKey(lib,{J(a.item)});
 if(!p) throw new Error('no item '+{J(a.item)});
@@ -398,14 +446,20 @@ for(const id of p.getAttachments()){{const x=Zotero.Items.get(id);
   if(x.attachmentContentType==='application/pdf') return x.key;}} return '';"""
         have = js(code, 60)
         if have:
-            print(f"item already has a PDF attachment ({have}); use --force to add another")
+            print(
+                f"item already has a PDF attachment ({have}); use --force to add another"
+            )
             return
     pdf_url, via = None, None
     if "openalex" in a.sources:
         pdf_url, via = openalex_pdf(doi)
     if not pdf_url and "unpaywall" in a.sources:
         pdf_url, via = unpaywall_pdf(doi, a.email)
-    if not pdf_url and "arxiv" in a.sources and doi.lower().startswith("10.48550/arxiv."):
+    if (
+        not pdf_url
+        and "arxiv" in a.sources
+        and doi.lower().startswith("10.48550/arxiv.")
+    ):
         pdf_url, via = arxiv_pdf(doi)
     if not pdf_url and "scihub" in a.sources:
         pdf_url, via = scihub_pdf(doi, a.mirrors)
@@ -425,8 +479,13 @@ return {{key:x.key,exists:await x.fileExists(),path:x.getFilePath()}};"""
 
 def api_get(url, timeout=30):
     try:
-        p = subprocess.run(["curl", "-s", "-m", str(timeout), url],
-                           capture_output=True, text=True, timeout=timeout + 10)
+        p = subprocess.run(
+            ["curl", "-s", "-m", str(timeout), url],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 10,
+            check=False,
+        )
         return json.loads(p.stdout) if p.stdout.strip() else None
     except (ValueError, subprocess.SubprocessError):
         return None
@@ -440,7 +499,7 @@ def openalex_pdf(doi):
     url = loc.get("pdf_url")
     if url:
         return url, "openalex"
-    for loc in (d.get("locations") or []):
+    for loc in d.get("locations") or []:
         if loc.get("pdf_url"):
             return loc["pdf_url"], "openalex"
     return None, None
@@ -457,7 +516,7 @@ def unpaywall_pdf(doi, email):
 
 
 def arxiv_pdf(doi):
-    m = re.search(r"10\.48550/arxiv\.(.+)", doi, re.I)
+    m = re.search(r"10\.48550/arxiv\.(.+)", doi, re.IGNORECASE)
     if not m:
         return None, None
     arxiv_id = re.sub(r"v\d+$", "", m.group(1))
@@ -517,38 +576,66 @@ return JSON.stringify(out);"""
             print(f"missing {m['key']} [{m['parent']}]: {m['expected']}")
             continue
         got = restore_file(m["expected"])
-        print(f"{m['key']} [{m['parent']}]: " + (f"restored {got}" if got else "NOT FOUND"))
+        print(
+            f"{m['key']} [{m['parent']}]: "
+            + (f"restored {got}" if got else "NOT FOUND")
+        )
         unresolved += 0 if got else 1
     sys.exit(3 if unresolved else 0)
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="zotero-add", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--library", "-L", default=os.environ.get("ZOTERO_LIBRARY"),
-                    help="'user', a group name (e.g. my-group), a groupID or a libraryID "
-                         "(default: $ZOTERO_LIBRARY)")
+    ap = argparse.ArgumentParser(
+        prog="zotero-add",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "--library",
+        "-L",
+        default=os.environ.get("ZOTERO_LIBRARY"),
+        help="'user', a group name (e.g. my-group), a groupID or a libraryID "
+        "(default: $ZOTERO_LIBRARY)",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("item", help="create an item (dup-checked), optionally with files/snapshot")
-    p.add_argument("type", help="Zotero item type: journalArticle, report, webpage, statute, letter, …")
+    p = sub.add_parser(
+        "item", help="create an item (dup-checked), optionally with files/snapshot"
+    )
+    p.add_argument(
+        "type",
+        help="Zotero item type: journalArticle, report, webpage, statute, letter, …",
+    )
     p.add_argument("--title", required=True)
     p.add_argument("--key", help="citation key to pin (Zotero 7 citationKey field)")
     p.add_argument("--person", action=Ordered, metavar="'Last, First[@role]'")
     p.add_argument("--org", action=Ordered, metavar="'Name[@role]'")
     p.add_argument("--date")
     p.add_argument("--url")
-    p.add_argument("--field", action="append", default=[], metavar="name=value",
-                   help="any other Zotero field, e.g. publicationTitle=…, DOI=…, institution=…")
+    p.add_argument(
+        "--field",
+        action="append",
+        default=[],
+        metavar="name=value",
+        help="any other Zotero field, e.g. publicationTitle=…, DOI=…, institution=…",
+    )
     p.add_argument("--collection", action="append", metavar="COLLKEY")
     p.add_argument("--tag", action="append")
-    p.add_argument("--no-default-tags", action="store_true", help=f"don't add {DEFAULT_TAGS}")
+    p.add_argument(
+        "--no-default-tags", action="store_true", help=f"don't add {DEFAULT_TAGS}"
+    )
     p.add_argument("--file", action="append", help="attach a local file (PDF, HTML, …)")
-    p.add_argument("--snapshot", action="store_true", help="save an HTML snapshot of --url via Zotero/SingleFile")
+    p.add_argument(
+        "--snapshot",
+        action="store_true",
+        help="save an HTML snapshot of --url via Zotero/SingleFile",
+    )
     p.add_argument("--force", action="store_true", help="skip the duplicate check")
     p.set_defaults(fn=cmd_item)
 
-    p = sub.add_parser("attach", help="add a file and/or snapshot to an existing item, then verify")
+    p = sub.add_parser(
+        "attach", help="add a file and/or snapshot to an existing item, then verify"
+    )
     p.add_argument("item", help="Zotero item key (8 chars)")
     p.add_argument("--file", action="append")
     p.add_argument("--snapshot", action="store_true")
@@ -556,38 +643,68 @@ def main():
     p.set_defaults(fn=cmd_attach)
 
     p = sub.add_parser("dups", help="look for existing records (exit 1 if any)")
-    p.add_argument("--title"); p.add_argument("--url"); p.add_argument("--doi"); p.add_argument("--key")
+    p.add_argument("--title")
+    p.add_argument("--url")
+    p.add_argument("--doi")
+    p.add_argument("--key")
     p.set_defaults(fn=cmd_dups)
 
-    p = sub.add_parser("check", help="list an item's attachments and whether their files exist")
+    p = sub.add_parser(
+        "check", help="list an item's attachments and whether their files exist"
+    )
     p.add_argument("item")
     p.set_defaults(fn=cmd_check)
 
-    p = sub.add_parser("audit", help="read-only health check: missing files + disk orphans (exit 1 if issues)")
-    p.add_argument("--since", metavar="YYYY-MM-DD", help="only attachments added after this date")
+    p = sub.add_parser(
+        "audit",
+        help="read-only health check: missing files + disk orphans (exit 1 if issues)",
+    )
+    p.add_argument(
+        "--since", metavar="YYYY-MM-DD", help="only attachments added after this date"
+    )
     p.set_defaults(fn=cmd_audit)
 
-    p = sub.add_parser("fetch-pdf", help="DOI -> PDF cascade (openalex, unpaywall, arxiv, scihub), then attach")
+    p = sub.add_parser(
+        "fetch-pdf",
+        help="DOI -> PDF cascade (openalex, unpaywall, arxiv, scihub), then attach",
+    )
     p.add_argument("item", help="Zotero item key (8 chars)")
     p.add_argument("--doi", help="DOI (default: the item's DOI field)")
-    p.add_argument("--sources", default="openalex,unpaywall,arxiv,scihub",
-                   help="comma-separated subset in order (default: all)")
-    p.add_argument("--mirrors", default="https://sci-hub.in/,https://sci-hub.ee/",
-                   help="Sci-Hub mirrors, comma-separated")
-    p.add_argument("--email", default=os.environ.get("UNPAYWALL_EMAIL", ""),
-                   help="contact email for Unpaywall (or set $UNPAYWALL_EMAIL); "
-                        "without one, the Unpaywall source is skipped")
-    p.add_argument("--force", action="store_true", help="attach even if the item already has a PDF")
+    p.add_argument(
+        "--sources",
+        default="openalex,unpaywall,arxiv,scihub",
+        help="comma-separated subset in order (default: all)",
+    )
+    p.add_argument(
+        "--mirrors",
+        default="https://sci-hub.in/,https://sci-hub.ee/",
+        help="Sci-Hub mirrors, comma-separated",
+    )
+    p.add_argument(
+        "--email",
+        default=os.environ.get("UNPAYWALL_EMAIL", ""),
+        help="contact email for Unpaywall (or set $UNPAYWALL_EMAIL); "
+        "without one, the Unpaywall source is skipped",
+    )
+    p.add_argument(
+        "--force", action="store_true", help="attach even if the item already has a PDF"
+    )
     p.set_defaults(fn=cmd_fetch_pdf)
 
-    p = sub.add_parser("repair", help="move files Attanger displaced back into group storage")
-    p.add_argument("--since", metavar="YYYY-MM-DD", help="only attachments added after this date")
+    p = sub.add_parser(
+        "repair", help="move files Attanger displaced back into group storage"
+    )
+    p.add_argument(
+        "--since", metavar="YYYY-MM-DD", help="only attachments added after this date"
+    )
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_repair)
 
     a = ap.parse_args()
     if not a.library:
-        die("say which library: --library my-group | user | <groupID> (or set ZOTERO_LIBRARY)")
+        die(
+            "say which library: --library my-group | user | <groupID> (or set ZOTERO_LIBRARY)"
+        )
     if a.cmd == "item":
         a.field_dict = {}
         for f in a.field:
