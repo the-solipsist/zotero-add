@@ -1620,7 +1620,7 @@ def main():
     a = ap.parse_args()
     if not a.library:
         die(
-            "say which library: --library my-group | user | <groupID> (or set ZOTERO_LIBRARY)"
+            "say which library: --library user | <groupName> | <groupID> (or set ZOTERO_LIBRARY)"
         )
     if a.cmd == "item":
         a.field_dict = {}
