@@ -15,10 +15,13 @@ Run `zotero-add --help` or `zotero-add <command> --help`.
 """
 
 import argparse
+import difflib
 import html
 import json
+import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -113,6 +116,405 @@ for(const it of await Zotero.Items.getAsync([...hits.keys()])){{
 }}
 return JSON.stringify(out);"""
     return js(code, 60)
+
+
+def dups_guard(force, library, title=None, url=None, doi=None, key=None):
+    """Print matching records and exit, unless --force was given."""
+    if force:
+        return
+    d = find_dups(library, title, url, doi, key)
+    if d:
+        print("Possible duplicates found; not adding (use --force to add anyway):")
+        for x in d:
+            print(
+                f"  {x['key']} [{x['citationKey']}] {x['type']} {x['date']} — {x['title']}"
+                f"  (match: {','.join(x['match'])})"
+            )
+        sys.exit(1)
+
+
+# ------------------------------------------------- direct arguments
+KNOWN_COMMANDS = (
+    "item",
+    "import-doi",
+    "attach",
+    "adopt",
+    "dups",
+    "check",
+    "audit",
+    "fetch-pdf",
+    "fill-metadata",
+    "repair",
+    "current",
+    "where",
+)
+
+DOI_ARG_RE = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/)?(10\.\d{4,9}/\S+)$", re.I)
+
+
+def resolve_intake(arg):
+    """Map a bare argument (DOI, PDF, item key) onto the subcommand that takes it.
+
+    Returns (command, note); dies with a hint when the argument cannot be routed,
+    so `zotero-add <doi>` behaves like `zotero-add import-doi <doi>`.
+    """
+    m = DOI_ARG_RE.match(arg)
+    if m:
+        return "import-doi", f"treating {m.group(1)} as a DOI"
+    if re.match(r"^(?:arxiv:)?\d{4}\.\d{4,5}(?:v\d+)?$", arg, re.I) or re.match(
+        r"^arxiv:", arg, re.I
+    ):
+        die(
+            "arXiv IDs are not importable yet: use `zotero-cli add arxiv <id>` "
+            "(it also fetches the PDF), or `zotero-add import-doi` once published"
+        )
+    if re.match(r"^https?://", arg, re.I):
+        if re.search(r"arxiv\.org/(?:abs|pdf)/", arg, re.I):
+            die(
+                "arXiv URLs are not importable yet: use `zotero-cli add arxiv <id>`, "
+                "or `zotero-add import-doi` for the published version"
+            )
+        die(
+            "webpages need a site translator: save the page with the Zotero connector, "
+            "then `zotero-add fill-metadata <key>`; use `adopt` for a local PDF"
+        )
+    path = os.path.abspath(os.path.expanduser(arg))
+    if path.lower().endswith(".pdf") and not os.path.isfile(path):
+        die(f"no such file: {path}")
+    if os.path.isfile(path):
+        if not path.lower().endswith(".pdf"):
+            die(f"only PDFs can be adopted: {path}")
+        return "adopt", f"treating {path} as a local PDF"
+    if re.fullmatch(r"[A-Z2-9]{8}", arg):
+        return "check", f"treating {arg} as a Zotero item key"
+    near = difflib.get_close_matches(arg, KNOWN_COMMANDS, n=1)
+    if near:
+        die(f"unknown command {arg!r} (did you mean {near[0]!r}?)")
+    die(
+        f"don't know what to do with {arg!r}: pass a command (see --help), "
+        "a DOI, a PDF, or an item key"
+    )
+
+
+def split_intake(argv):
+    """Split argv into (prefix, candidate, rest); take a leading --dry-run out.
+
+    Global options (`-L/--library`) are kept in the prefix so they still apply
+    after the subcommand is rewritten in.
+    """
+    prefix, dry, i = [], False, 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("-L", "--library"):
+            prefix += argv[i : i + 2]
+            i += 2
+            continue
+        if tok == "--dry-run":
+            dry = True
+            i += 1
+            continue
+        if tok.startswith("-"):
+            prefix.append(tok)
+            i += 1
+            continue
+        break
+    rest = argv[i + 1 :]
+    return prefix, (argv[i] if i < len(argv) else None), rest, dry
+
+
+def current_target():
+    """Where a save would go right now — the same logic the browser connector uses."""
+    code = """
+const t = Zotero.Server.Connector.getSaveTarget(true, true);
+const pane = Zotero.getActiveZoteroPane();
+const sel = pane ? pane.getSelectedItems() : [];
+return JSON.stringify({
+  library: t.library.name, libraryID: t.library.libraryID, editable: t.editable,
+  collection: t.collection ? t.collection.key : null,
+  collectionName: t.collection ? t.collection.name : null,
+  items: sel.map(i => ({key: i.key, type: i.itemType, title: i.getField('title').slice(0, 80)}))
+});"""
+    return js(code, 30)
+
+
+def apply_current_collection(a):
+    """Replace `--collection current` with the collection selected in Zotero."""
+    cols = getattr(a, "collection", None)
+    if not cols:
+        return
+    single = isinstance(cols, str)
+    values = [cols] if single else list(cols)
+    if "current" not in values:
+        return
+    t = current_target()
+    if not t.get("collection"):
+        die(
+            "no collection is selected in Zotero: select one in the left pane, "
+            "or pass a collection key instead of `current`"
+        )
+    if a.library:
+        lib_id = js(f"return {lib_js(a.library)}", 30)
+        if str(lib_id) != str(t["libraryID"]):
+            die(
+                f"--collection current is in {t['library']} (libraryID {t['libraryID']}), "
+                f"but --library resolves to libraryID {lib_id}; select a collection there "
+                "or pass a key"
+            )
+    values = [t["collection"] if v == "current" else v for v in values]
+    a.collection = values[0] if single else values
+
+
+def cmd_current(a):
+    t = current_target()
+    print(f"library:    {t['library']}")
+    print(
+        "collection: "
+        + (f"{t['collectionName']} [{t['collection']}]" if t.get("collection") else "(none — library root)")
+    )
+    if t["items"]:
+        for x in t["items"][:10]:
+            print(f"selected:   {x['key']} {x['type']} — {x['title']}")
+    else:
+        print("selected:   (no items selected)")
+
+
+def _norm_text(s):
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+STOPWORDS = {
+    "the", "and", "for", "with", "from", "into", "over", "under", "this", "that",
+    "these", "those", "its", "their", "our", "your", "his", "her", "not", "but",
+    "are", "was", "were", "has", "have", "had", "will", "would", "can", "could",
+    "page", "pages", "vol", "issue", "report", "a", "an", "in", "of", "to", "on",
+    "at", "by", "as", "is", "it", "or", "be", "do", "if", "no", "up", "vs", "via",
+    "per", "new", "how", "why", "what", "when", "who",
+}
+
+
+def _keywords(s):
+    return {w for w in _norm_text(s).split() if len(w) > 1 and w not in STOPWORDS}
+
+
+def _acronyms(s):
+    """Lower-case initials of 2-4 consecutive content words: 'chronic myeloid leukemia' -> cml."""
+    words = [w for w in _norm_text(s).split() if w not in STOPWORDS]
+    out = set()
+    for n in (2, 3, 4):
+        for i in range(len(words) - n + 1):
+            out.add("".join(w[0] for w in words[i : i + n]))
+    return out
+
+
+def _title_sim(a, b):
+    """0..1 similarity, same conservative rule as find_dups uses for titles."""
+    na, nb = _norm_text(a), _norm_text(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    short, long = sorted((na, nb), key=len)
+    if len(short) >= 20 and short in long and len(short) >= 0.7 * len(long):
+        return 0.85
+    ta, tb = set(na.split()), set(nb.split())
+    return len(ta & tb) / len(ta | tb) if ta and tb else 0.0
+
+
+def cmd_where(a):
+    """Suggest collections for a DOI or item key. Read-only: never writes."""
+    ref = (a.ref or "").strip()
+    doi = item_key = None
+    if ref:
+        m = DOI_ARG_RE.match(ref)
+        if m:
+            doi = m.group(1)
+        elif re.fullmatch(r"[A-Z2-9]{8}", ref):
+            item_key = ref
+        else:
+            die(
+                f"{ref!r} is neither a DOI nor an 8-character item key "
+                "(or pass --title 'Some title')"
+            )
+    title, journal = a.title or "", a.journal or ""
+    if doi and not title:
+        work = api_get(f"https://api.crossref.org/works/{doi}")
+        msg = (work or {}).get("message") or {}
+        if msg:
+            title = clean_text((msg.get("title") or [""])[0])
+            journal = journal or clean_text((msg.get("container-title") or [""])[0])
+    if not ref and not title:
+        die("pass a DOI, an 8-character item key, or --title 'Some title'")
+    if not title and not item_key:
+        die("could not read a title from that DOI; pass --title 'Some title'")
+
+    d = js(
+        f"""
+const lib={lib_js(a.library)};
+const DOI={J(doi or "")}, KEY={J(item_key or "")}, TITLE={J(title)}, JOURNAL={J(journal)};
+const norm=s=>(s||"").toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g," ").trim();
+const cpath=c=>{{const p=[c.name];let x=c;while(x.parentID){{x=Zotero.Collections.get(x.parentID);
+  if(!x) break;p.unshift(x.name);}}return p.join(" / ");}};
+let target=null;
+if(KEY) target=await Zotero.Items.getByLibraryAndKeyAsync(lib,KEY);
+else if(DOI){{const s=new Zotero.Search();s.libraryID=lib;s.addCondition("DOI","is",DOI);
+  const h=await s.search();if(h.length) target=await Zotero.Items.getAsync(h[0]);}}
+let t=TITLE, j=JOURNAL;
+if(target){{if(!t) t=target.getField("title")||"";
+  if(!j) j=target.getField("publicationTitle")||target.getField("proceedingsTitle")
+    ||target.getField("bookTitle")||"";}}
+const ids=new Set();
+const words=norm(t).split(" ").filter(w=>w.length>3).sort((a,b)=>b.length-a.length).slice(0,3);
+for(const w of words){{const s=new Zotero.Search();s.libraryID=lib;
+  s.addCondition("title","contains",w);for(const id of await s.search()) ids.add(id);}}
+if(j){{for(const f of ["publicationTitle","proceedingsTitle","bookTitle"]){{try{{
+  const s=new Zotero.Search();s.libraryID=lib;s.addCondition(f,"is",j);
+  for(const id of await s.search()) ids.add(id);}}catch(e){{}}}}}}
+const out=[];
+for(const it of await Zotero.Items.getAsync([...ids].slice(0,300))){{
+  if(!it.isRegularItem()||it.deleted) continue;
+  if(target && it.id===target.id) continue;
+  out.push({{key:it.key,title:it.getField("title"),
+    journal:it.getField("publicationTitle")||it.getField("proceedingsTitle")
+      ||it.getField("bookTitle")||"",
+    collections:it.getCollections().map(id=>Zotero.Collections.get(id)).filter(Boolean).map(cpath)}});
+}}
+return JSON.stringify({{title:t,journal:j,
+  target:target?{{key:target.key,title:target.getField("title"),
+    collections:target.getCollections().map(id=>Zotero.Collections.get(id)).filter(Boolean).map(cpath)}}:null,
+  candidates:out,
+  collectionNames:Zotero.Collections.getByLibrary(lib,true).map(c=>({{key:c.key,path:cpath(c)}}))}});""",
+        120,
+    )
+    if not isinstance(d, dict):
+        die(f"could not read the library: {d}")
+
+    paths = {c["path"]: c["key"] for c in d.get("collectionNames") or []}
+    title, journal = d.get("title") or title, d.get("journal") or journal
+    scores = {}
+    unfiled = []
+    name_words = _keywords(title) | _acronyms(title)
+    for c in d.get("candidates") or []:
+        sim = _title_sim(title, c.get("title") or "")
+        same_j = bool(journal) and _norm_text(journal) == _norm_text(c.get("journal"))
+        if not same_j and sim < 0.4:
+            continue
+        weight = (3.0 if same_j else 0.0) + 5.0 * sim
+        if not c.get("collections"):
+            unfiled.append((round(sim, 2), c["key"], (c.get("title") or "")[:70]))
+        for path in c["collections"]:
+            s = scores.setdefault(
+                path, {"score": 0.0, "similar": 0, "same_journal": 0, "why": []}
+            )
+            s["score"] += weight
+            s["ev"] = s.get("ev", 0.0) + weight
+            s["similar"] += 1
+            s["same_journal"] += 1 if same_j else 0
+            if sim >= 0.4 and len(s["why"]) < 2:
+                s["why"].append(
+                    {
+                        "sim": round(sim, 2),
+                        "key": c["key"],
+                        "title": (c.get("title") or "")[:70],
+                    }
+                )
+    # collection names sharing a word with the title/journal; rare words count more,
+    # so "CML" is a stronger hint than "India"
+    path_words = {p: _keywords(p) for p in paths}
+    df = {}
+    for toks in path_words.values():
+        for w in toks:
+            df[w] = df.get(w, 0) + 1
+    for path, toks in path_words.items():
+        hit = toks & name_words
+        if not hit:
+            continue
+        bonus = sum(2.0 * math.log((len(path_words) + 1) / (df[w] + 1)) for w in hit)
+        s = scores.setdefault(
+            path, {"score": 0.0, "similar": 0, "same_journal": 0, "why": []}
+        )
+        s["nm"] = s.get("nm", 0.0) + bonus
+        s["why"].append({"note": "name matches: " + ", ".join(sorted(hit))})
+
+    # what people actually did outranks what a collection happens to be called
+    for v in scores.values():
+        v["score"] = v.get("ev", 0.0) + v.get("nm", 0.0)
+    by_evidence = sorted(
+        ((p, v) for p, v in scores.items() if v.get("ev", 0) > 0),
+        key=lambda kv: (kv[1]["ev"], kv[1].get("nm", 0)),
+        reverse=True,
+    )
+    by_name = sorted(
+        ((p, v) for p, v in scores.items() if v.get("nm", 0) > 0),
+        key=lambda kv: kv[1]["nm"],
+        reverse=True,
+    )
+    if not by_evidence:  # one hint per matched word, else every nested namesake shows up
+        seen, deduped = set(), []
+        for path, v in by_name:
+            sig = tuple(sorted(_keywords(path) & name_words))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            deduped.append((path, v))
+        by_name = deduped
+    ranked = (by_evidence or by_name)[: max(1, a.limit)]
+    rare = []
+    for path, v in by_name:
+        hit = path_words.get(path, set()) & name_words
+        if hit and min(df.get(w, 99) for w in hit) <= 2:
+            rare.append((path, v))
+    hints = [p for p, _ in rare if p not in dict(ranked)][:2] if by_evidence else []
+    if a.json:
+        print(
+            json.dumps(
+                {
+                    "title": title,
+                    "journal": journal,
+                    "current": (d.get("target") or {}).get("collections"),
+                    "suggestions": [
+                        {"collection": p, "key": paths.get(p), **v} for p, v in ranked
+                    ],
+                    "name_hints": hints,
+                    "unfiled": unfiled,
+                },
+                indent=1,
+            )
+        )
+        return
+
+    print(f"looking for: {title[:100]}" + (f"  ({journal})" if journal else ""))
+    tgt = d.get("target")
+    if tgt:
+        print(f"already in:  {', '.join(tgt['collections']) or '(unfiled)'}")
+    if not ranked:
+        print("no similar items found; an unfiled save is probably right")
+    else:
+        print(
+            "\nwhere similar items sit:"
+            if by_evidence
+            else "\nno items like this yet; collections named like it:"
+        )
+        for i, (path, v) in enumerate(ranked, 1):
+            ev = []
+            if v["similar"]:
+                ev.append(f"{v['similar']} similar")
+            if v["same_journal"]:
+                ev.append(f"{v['same_journal']} same journal")
+            print(
+                f"  {i}. {path} [{paths.get(path, '?')}]  score {v['score']:.1f}"
+                + (f"  ({', '.join(ev)})" if ev else "")
+            )
+            for e in v["why"]:
+                if "note" in e:
+                    print(f"       · {e['note']}")
+                else:
+                    print(f"       · {e['sim']:.2f} {e['key']}  {e['title']}")
+        if hints:
+            print("\nname also suggests: " + ", ".join(f"{h} [{paths.get(h, '?')}]" for h in hints))
+    if unfiled:
+        print(f"\n{len(unfiled)} similar item(s) are unfiled:")
+        for sim, key, t in unfiled[:3]:
+            print(f"  · {sim:.2f} {key}  {t}")
 
 
 # ---------------------------------------------------------------- attachments
@@ -278,15 +680,7 @@ class Ordered(argparse.Action):
 
 
 def cmd_item(a):
-    if not a.force:
-        d = find_dups(a.library, a.title, a.url, a.field_dict.get("DOI"), a.key)
-        if d:
-            print("Possible duplicates found; not adding (use --force to add anyway):")
-            for x in d:
-                print(
-                    f"  {x['key']} [{x['citationKey']}] {x['type']} {x['date']} — {x['title']}  (match: {','.join(x['match'])})"
-                )
-            sys.exit(1)
+    dups_guard(a.force, a.library, a.title, a.url, a.field_dict.get("DOI"), a.key)
     fields = dict(a.field_dict)
     fields["title"] = a.title
     if a.date:
@@ -533,6 +927,9 @@ def adopt_arxiv(a, arxiv_id, path):
     title = clean_text("".join(title_el.itertext())) if title_el is not None else ""
     if not title:
         die(f"arXiv record for {arxiv_id} has no title")
+    dups_guard(
+        a.force, a.library, title, f"https://arxiv.org/abs/{arxiv_id}", None, a.key
+    )
     pub_el = entry.find("atom:published", ns)
     pub = ((pub_el.text or "")[:10]) if pub_el is not None else ""
     names = [
@@ -719,15 +1116,8 @@ def cmd_adopt(a):
 
 def cmd_import_doi(a):
     doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", a.doi.strip(), flags=re.IGNORECASE)
-    if not a.force:
-        d = find_dups(a.library, None, None, doi, a.key)
-        if d:
-            print("Possible duplicates found; not adding (use --force to add anyway):")
-            for x in d:
-                print(
-                    f"  {x['key']} [{x['citationKey']}] {x['type']} {x['date']} — {x['title']}"
-                )
-            sys.exit(1)
+    # cheap pre-fetch check on the identifier; the title check follows the fetch
+    dups_guard(a.force, a.library, None, None, doi, a.key)
     work = api_get(f"https://api.crossref.org/works/{doi}")
     if not work or "message" not in work:
         die(f"crossref has no record for {doi}")
@@ -736,6 +1126,8 @@ def cmd_import_doi(a):
     title = clean_text((work.get("title") or [""])[0])
     if not title:
         die(f"crossref record for {doi} has no title")
+    # identifiers can differ (preprint vs published version); check the title too
+    dups_guard(a.force, a.library, title, None, None, a.key)
     fields = {"title": title, "DOI": doi}
     pub = (
         work.get("published")
@@ -1427,6 +1819,13 @@ def main():
         prog="zotero-add",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Direct arguments:
+  A bare DOI, PDF path or 8-character item key is routed to the command that
+  takes it, so `zotero-add 10.1234/abc`, `zotero-add paper.pdf` and
+  `zotero-add ABC23456` work. Add --dry-run to print the resolved command
+  without running it.
+""",
     )
     ap.add_argument(
         "--library",
@@ -1435,7 +1834,27 @@ def main():
         help="'user', a group name (e.g. my-group), a groupID or a libraryID "
         "(default: $ZOTERO_LIBRARY)",
     )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with a bare argument, print the routed command instead of running it",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser(
+        "where", help="suggest collections for a DOI/key (advisory, never writes)"
+    )
+    p.add_argument("ref", nargs="?", metavar="DOI|ITEMKEY")
+    p.add_argument("--title", help="title to match on when no DOI/key is given")
+    p.add_argument("--journal", help="journal or container title to match on")
+    p.add_argument("--limit", type=int, default=8, help="collections to show (default 8)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(fn=cmd_where)
+
+    p = sub.add_parser(
+        "current", help="show the library/collection/item selected in Zotero"
+    )
+    p.set_defaults(fn=cmd_current)
 
     p = sub.add_parser(
         "item", help="create an item (dup-checked), optionally with files/snapshot"
@@ -1617,11 +2036,28 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_repair)
 
-    a = ap.parse_args()
+    # route a bare DOI / PDF / item key onto its subcommand
+    prefix, cand, rest, dry = split_intake(list(sys.argv[1:]))
+    argv = prefix + ([cand] if cand else []) + rest
+    if cand and not cand.startswith("-") and cand not in KNOWN_COMMANDS:
+        cmd, note = resolve_intake(cand)
+        argv = prefix + [cmd, cand] + rest
+        if dry:
+            print("zotero-add " + shlex.join(argv))
+            return
+        print(f"zotero-add: {note} -> {cmd}", file=sys.stderr)
+    elif dry and cand:
+        argv = prefix + [cand, "--dry-run"] + rest
+
+    a = ap.parse_args(argv)
+    if a.cmd == "current":
+        a.fn(a)
+        return
     if not a.library:
         die(
             "say which library: --library user | <groupName> | <groupID> (or set ZOTERO_LIBRARY)"
         )
+    apply_current_collection(a)
     if a.cmd == "item":
         a.field_dict = {}
         for f in a.field:

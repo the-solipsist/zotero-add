@@ -34,6 +34,36 @@ zotero-add -L my-group dups --title "..."
 
 ## Usage
 
+### 0. Direct Arguments (`zotero-add <doi|pdf|key>`)
+
+A bare argument is routed to the command that takes it, so you don't have to remember
+the taxonomy:
+
+```sh
+zotero-add https://doi.org/10.3324/haematol.2026.301753   # -> import-doi
+zotero-add ~/papers/mystery-paper.pdf                     # -> adopt
+zotero-add QPCABAHY                                       # -> check
+zotero-add --dry-run 10.3324/haematol.2026.301753         # print the routed command only
+```
+
+Flags after the argument are passed through to the routed command
+(`zotero-add 10.1234/abc --collection UFNUEIWT`). arXiv IDs and webpages are refused with
+a pointer to `zotero-cli add arxiv` / the Zotero connector, because neither can be saved
+faithfully without a translator.
+
+Collections are **never inferred**: without `--collection` the item is saved unfiled
+(Zotero's "Unfiled Items" view finds it later). You can ask for the *currently selected*
+collection explicitly, which resolves to whatever is highlighted in Zotero's left pane —
+the same target the browser connector would use:
+
+```sh
+zotero-add current                                  # library, collection, selected items
+zotero-add 10.1234/abc --collection current         # file it where you're looking
+```
+
+If the selection lives in a different library from `--library`, or nothing is selected,
+it stops and says so rather than guessing.
+
 ### 1. Check for Duplicates (`dups`)
 
 Searches the library by title, URL, DOI, or citation key before adding (exits with code 1 if duplicates exist):
@@ -41,6 +71,38 @@ Searches the library by title, URL, DOI, or citation key before adding (exits wi
 ```sh
 zotero-add dups --title "Designing Data Governance" --doi "10.1038/..."
 ```
+
+### 1b. Ask Where It Would Go (`where`)
+
+Advisory only — reads the library and never writes. Given a DOI, an item key, or just a
+title, it reports which collections already hold items like this one, and which
+collections are named after it (acronyms included, so "chronic myeloid leukemia" matches
+a `CML` collection):
+
+```sh
+zotero-add where 10.3324/haematol.2026.301753
+zotero-add where QPCABAHY
+zotero-add where --title "State of DPI in India 2025" --journal "Report"
+zotero-add where QPCABAHY --json
+```
+
+Ranking uses what people actually did — items with matching titles, and items in the
+same journal — and only then collection names. A collection name that is the only
+evidence is shown separately, as a hint.
+
+Every creating command runs the same check and refuses to add on a hit (`--force` overrides):
+
+| command | checked before creating | when |
+|---|---|---|
+| `item` | title, URL, DOI, citation key | before saving |
+| `import-doi` | DOI, citation key; then title | before the Crossref call, and again after it (catches preprints vs published versions, or records with a different DOI) |
+| `adopt` (DOI found) | same as `import-doi`, after resolving the DOI | before saving |
+| `adopt` (arXiv only) | title, arXiv URL, citation key | before saving |
+
+Title matching is deliberately conservative: it requires an exact normalized match, or
+the shorter title to be ≥70% of the longer one and contained in it. Short titles
+("Data Governance") therefore match only exactly — check with `dups` when in doubt.
+The check looks only at the library you target, not at your other libraries.
 
 ### 2. Add Items
 
